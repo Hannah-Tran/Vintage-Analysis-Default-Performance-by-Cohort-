@@ -1,7 +1,7 @@
 # Vintage Analysis of Consumer Loan Default Using SQL
 
 ## 📊 Project Overview
-This project analyses over 2 million peer-to-peer loans from the Lending Club dataset (2007–2018) by origination cohort ("vintage"). It examines whether newer cohorts perform worse than older ones at the same age, when in a loan's life default occurs, whether underwriting standards changed as the lender grew, and whether each cohort was priced to cover the losses it produced. The analysis applies survival and hazard-rate concepts from the CQF credit risk module and the PD × LGD × EAD framework, implemented entirely in SQL.
+This project analyses over 2 million peer-to-peer loans from the Lending Club dataset (2007-2018) by origination cohort ("vintage"). It examines whether newer cohorts perform worse than older ones at the same age, when in a loan's life default occurs, whether underwriting standards changed as the lender grew, and whether each cohort was priced to cover the losses it produced. The analysis applies survival and hazard-rate concepts from the PD × LGD × EAD framework, implemented entirely in SQL.
 
 ## 🎯 Objective
 To replicate the vintage monitoring a retail credit risk team performs: building like-for-like vintage curves, estimating lifetime probability of default from an empirical survival curve, separating underwriting effects from macroeconomic effects, and testing pricing adequacy, presented as a portfolio-ready case study.
@@ -51,7 +51,7 @@ The data ends in late 2018. A loan issued in 2012 has completed its full life, w
 - **Survival probability and hazard rate:** `P(0,T) = exp(−∫λ dt)` and `λᵢ = −(1/τ)·ln(P(Tᵢ)/P(Tᵢ₋₁))` (CQF Lecture 5.7, Estimating Default Probability), estimated empirically from loan outcomes
 - **Lifetime PD:** cumulative default at contract maturity, as used in IFRS 9 Stage 2 provisioning
 - **Expected Loss (PD × LGD × EAD):** each component measured by vintage
-- **Credit triangle:** `spread ≈ λ × (1 − RR)` (CQF M5S8), used as a break-even pricing check
+- **Credit triangle:** `spread ≈ λ × (1 - RR)` (CQF M5S8), used as a break-even pricing check
 - **ECL / CVA analogy:** lifetime ECL shares the CVA structure `(1 − R) × ∫ EE × DF × dPD` (CQF M5S5); marginal PDs from the life table supply the dPD term
 - **Credit cycle analysis:** separating underwriting quality from macroeconomic conditions
 
