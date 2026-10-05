@@ -1,0 +1,431 @@
+-- ============================================================
+-- Project: Credit Portfolio Risk Analysis Using SQL
+-- Author:  Hannah (Huong) Tran
+-- Analysis C: Vintage Analysis (Default Performance by Cohort)
+-- Dataset: Lending Club accepted loans, 2007-2018
+-- Table:   accepted_2007_to_2018Q4
+--
+-- Description: A "vintage" is the group of loans originated in
+--              the same period. Vintage analysis answers three
+--              questions a credit risk team asks every month:
+--                1. Is a new cohort performing worse than older
+--                   cohorts AT THE SAME AGE? (early warning)
+--                2. WHEN in a loan's life does default happen?
+--                   (seasoning, lifetime PD for IFRS 9 / pricing)
+--                3. Did underwriting standards or the economy
+--                   change the quality of what was originated?
+--
+-- Frameworks:  Cohort / vintage curves, life-table hazard rates,
+--              survival probability, lifetime PD, LGD,
+--              Expected Loss, credit triangle (spread vs loss)
+--
+-- KEY METHOD POINT - right-censoring:
+--   The data ends in late 2018. A 2017 loan has had at most ~2
+--   years to default; a 2012 loan has had its whole life. Simply
+--   comparing "default rate by year" therefore makes recent
+--   vintages look safer than they are. Every query below either
+--   compares vintages at the SAME age or adjusts for censoring.
+--
+-- HOW TO RUN: run QUERY 0 once (it builds a helper table), click
+--   Write Changes, then highlight one query at a time and press F5.
+-- ============================================================
+
+
+-- ============================================================
+-- QUERY 0 (SETUP): Build a helper table with loan age and
+--                  months-on-book (MOB) for every loan
+-- ============================================================
+-- Context: Dates in this dataset are text such as 'Dec-2015', so
+-- they cannot be subtracted directly. Here each date is turned
+-- into a month index (year x 12 + month), which lets us measure:
+--   loan_age  = months from origination to the data cut-off
+--   exit_mob  = months on book when the loan left observation:
+--               - defaulted loans : month of last payment
+--               - fully paid loans: month of final payment
+--               - still open loans: current age (censored)
+-- Note: the last payment date is a proxy for the start of
+-- distress; the formal charge-off usually follows ~4-5 months
+-- later (120+ days past due).
+-- A table (not a view) is used so this heavy step runs only once.
+
+DROP TABLE IF EXISTS vintage_base;
+
+CREATE TABLE vintage_base AS
+WITH parsed AS (
+    SELECT
+        id,
+        grade,
+        term,
+        purpose,
+        CAST(funded_amnt     AS REAL)    AS funded_amnt,
+        CAST(int_rate        AS REAL)    AS int_rate,
+        CAST(fico_range_low  AS REAL)    AS fico,
+        CAST(dti             AS REAL)    AS dti,
+        CAST(total_rec_prncp AS REAL)    AS total_rec_prncp,
+        CAST(recoveries      AS REAL)    AS recoveries,
+        CAST(collection_recovery_fee AS REAL) AS recovery_fee,
+        loan_status,
+        CAST(SUBSTR(issue_d, -4) AS INTEGER) AS vintage,
+        CAST(SUBSTR(issue_d, -4) AS INTEGER) * 12 +
+            CASE SUBSTR(issue_d, 1, 3)
+                WHEN 'Jan' THEN 1  WHEN 'Feb' THEN 2  WHEN 'Mar' THEN 3
+                WHEN 'Apr' THEN 4  WHEN 'May' THEN 5  WHEN 'Jun' THEN 6
+                WHEN 'Jul' THEN 7  WHEN 'Aug' THEN 8  WHEN 'Sep' THEN 9
+                WHEN 'Oct' THEN 10 WHEN 'Nov' THEN 11 WHEN 'Dec' THEN 12
+            END                                  AS issue_idx,
+        CASE WHEN NULLIF(last_pymnt_d, '') IS NULL THEN NULL
+             ELSE CAST(SUBSTR(last_pymnt_d, -4) AS INTEGER) * 12 +
+                CASE SUBSTR(last_pymnt_d, 1, 3)
+                    WHEN 'Jan' THEN 1  WHEN 'Feb' THEN 2  WHEN 'Mar' THEN 3
+                    WHEN 'Apr' THEN 4  WHEN 'May' THEN 5  WHEN 'Jun' THEN 6
+                    WHEN 'Jul' THEN 7  WHEN 'Aug' THEN 8  WHEN 'Sep' THEN 9
+                    WHEN 'Oct' THEN 10 WHEN 'Nov' THEN 11 WHEN 'Dec' THEN 12
+                END
+        END                                      AS last_pay_idx,
+        -- Older loans carry the label "Does not meet the credit policy.
+        -- Status:Charged Off", so LIKE is used instead of '='
+        CASE WHEN loan_status LIKE '%Charged Off%' OR loan_status = 'Default'
+             THEN 1 ELSE 0 END                   AS is_default,
+        CASE WHEN loan_status LIKE '%Fully Paid%'
+             THEN 1 ELSE 0 END                   AS is_paid
+    FROM accepted_2007_to_2018Q4
+    WHERE NULLIF(issue_d, '') IS NOT NULL
+),
+cutoff AS (
+    SELECT MAX(issue_idx) AS cutoff_idx FROM parsed
+)
+SELECT
+    p.*,
+    CASE WHEN TRIM(p.term) LIKE '60%' THEN 60 ELSE 36 END    AS term_months,
+    c.cutoff_idx - p.issue_idx                               AS loan_age,
+    CASE
+        WHEN p.is_default = 1 OR p.is_paid = 1
+            THEN MAX(COALESCE(p.last_pay_idx, p.issue_idx) - p.issue_idx, 0)
+        ELSE c.cutoff_idx - p.issue_idx
+    END                                                      AS exit_mob
+FROM parsed p, cutoff c;
+
+-- Quick check: one row per loan, sensible ages
+SELECT COUNT(*) AS loans, MIN(vintage) AS first_vintage, MAX(vintage) AS last_vintage,
+       MAX(loan_age) AS oldest_loan_months
+FROM vintage_base;
+
+
+-- ============================================================
+-- QUERY 1: How large is each vintage, and how much of it has
+--          reached a final outcome?
+-- ============================================================
+-- Context: Before judging any vintage, an analyst checks how
+-- "mature" it is. If 80% of a vintage is still open, its default
+-- rate today says little about its lifetime default rate.
+-- This query makes the censoring problem visible.
+
+SELECT
+    vintage,
+    COUNT(*)                                            AS loans,
+    ROUND(SUM(funded_amnt) / 1000000.0, 1)              AS originated_millions,
+    ROUND(100.0 * AVG(term_months = 60), 1)             AS pct_60_month,
+    ROUND(100.0 * AVG(is_paid), 1)                      AS pct_fully_paid,
+    ROUND(100.0 * AVG(is_default), 1)                   AS pct_defaulted,
+    ROUND(100.0 * AVG(1 - is_paid - is_default), 1)     AS pct_still_open,
+    MIN(loan_age)                                       AS youngest_loan_months,
+    MAX(loan_age)                                       AS oldest_loan_months
+FROM vintage_base
+GROUP BY vintage
+ORDER BY vintage;
+
+
+-- ============================================================
+-- QUERY 2: Why "default rate by year" is misleading
+-- ============================================================
+-- Context: Two common shortcuts both give the wrong answer for
+-- recent vintages:
+--   naive_default_pct    = defaults / all loans
+--       -> understates risk: open loans have not had time to fail
+--   resolved_default_pct = defaults / (defaults + fully paid)
+--       -> overstates risk: in a young vintage, the loans that
+--          have already finished are mostly early failures
+-- The gap between the two columns shows how unreliable a
+-- single-number comparison is. Queries 3 and 4 fix this.
+
+SELECT
+    vintage,
+    COUNT(*)                                                        AS loans,
+    ROUND(100.0 * AVG(is_default), 2)                               AS naive_default_pct,
+    ROUND(100.0 * SUM(is_default) / NULLIF(SUM(is_default + is_paid), 0), 2)
+                                                                    AS resolved_default_pct,
+    ROUND(100.0 * AVG(1 - is_paid - is_default), 1)                 AS pct_still_open
+FROM vintage_base
+GROUP BY vintage
+ORDER BY vintage;
+
+
+-- ============================================================
+-- QUERY 3: Vintage curves - cumulative default rate at the
+--          same age (6, 12, 24, 36, 48 months on book)
+-- ============================================================
+-- Context: This is the standard vintage table used in retail
+-- credit risk. Each cell is:
+--   loans that defaulted within N months
+--   / all loans that are at least N months old
+-- Loans younger than N months are excluded from that column, so
+-- every vintage is compared at the same age. Blank (NULL) cells
+-- mean the vintage is not yet old enough to measure.
+-- Read across a row  -> how a cohort's losses build up over time
+-- Read down a column -> whether newer cohorts are better or worse
+-- Split by term because 36- and 60-month loans season differently
+-- and the share of 60-month loans changed over time.
+
+SELECT
+    vintage,
+    term_months,
+    COUNT(*) AS loans,
+    ROUND(100.0 * SUM(CASE WHEN loan_age >= 6  AND is_default = 1 AND exit_mob <= 6  THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN loan_age >= 6  THEN 1 ELSE 0 END), 0), 2) AS cdr_6m,
+    ROUND(100.0 * SUM(CASE WHEN loan_age >= 12 AND is_default = 1 AND exit_mob <= 12 THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN loan_age >= 12 THEN 1 ELSE 0 END), 0), 2) AS cdr_12m,
+    ROUND(100.0 * SUM(CASE WHEN loan_age >= 24 AND is_default = 1 AND exit_mob <= 24 THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN loan_age >= 24 THEN 1 ELSE 0 END), 0), 2) AS cdr_24m,
+    ROUND(100.0 * SUM(CASE WHEN loan_age >= 36 AND is_default = 1 AND exit_mob <= 36 THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN loan_age >= 36 THEN 1 ELSE 0 END), 0), 2) AS cdr_36m,
+    ROUND(100.0 * SUM(CASE WHEN loan_age >= 48 AND is_default = 1 AND exit_mob <= 48 THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN loan_age >= 48 THEN 1 ELSE 0 END), 0), 2) AS cdr_48m
+FROM vintage_base
+GROUP BY vintage, term_months
+HAVING COUNT(*) >= 1000
+ORDER BY term_months, vintage;
+
+
+-- ============================================================
+-- QUERY 4: When do loans default? Hazard rate, survival curve
+--          and lifetime PD (life-table method)
+-- ============================================================
+-- Context: This is the empirical version of the intensity model
+-- in CQF Lecture 5.7. Loan life is cut into 6-month windows:
+--   at_risk          = loans still alive and observed at the start
+--   marginal_pd      = h = defaults in window / adjusted at_risk
+--                      (censored loans count as half a window -
+--                       the standard actuarial adjustment)
+--   survival         = S(t) = product of (1 - h) so far
+--                      -> discrete form of exp(-integral lambda)
+--   cumulative_pd    = 1 - S(t)  -> lifetime PD at the term end
+--   approx hazard    = h / 0.5 years. Exact CQF form is
+--                      -ln(1 - h) / 0.5; the two agree when h is
+--                      small. (LN() needs SQLite math functions.)
+-- Fully paid and still-open loans are treated as censored, so h
+-- is the default hazard given the loan has not exited by any
+-- route (prepayment is a competing risk).
+-- Uses a recursive CTE to multiply survival step by step.
+-- Business use: the hump in marginal PD shows when collections
+-- effort matters most; cumulative PD at 36/60 months is the
+-- lifetime PD used in pricing and IFRS 9 Stage 2 provisioning.
+
+WITH events AS (
+    SELECT
+        term_months,
+        CASE WHEN exit_mob <= 0 THEN 0 ELSE (exit_mob - 1) / 6 END   AS window_no,
+        is_default
+    FROM vintage_base
+),
+counts AS (
+    SELECT
+        term_months,
+        window_no,
+        COUNT(*)                      AS exits,
+        SUM(is_default)               AS defaults,
+        COUNT(*) - SUM(is_default)    AS censored
+    FROM events
+    GROUP BY term_months, window_no
+),
+life AS (
+    SELECT
+        term_months, window_no, defaults, censored,
+        SUM(exits) OVER (PARTITION BY term_months ORDER BY window_no DESC) AS at_risk
+    FROM counts
+),
+haz AS (
+    SELECT
+        term_months, window_no, at_risk, defaults, censored,
+        1.0 * defaults / (at_risk - 0.5 * censored) AS h
+    FROM life
+),
+surv(term_months, window_no, s) AS (
+    SELECT term_months, window_no, 1.0 - h
+    FROM haz
+    WHERE window_no = 0
+    UNION ALL
+    SELECT h.term_months, h.window_no, s.s * (1.0 - h.h)
+    FROM surv s
+    JOIN haz h
+      ON h.term_months = s.term_months
+     AND h.window_no   = s.window_no + 1
+)
+SELECT
+    h.term_months,
+    (h.window_no * 6) || '-' || (h.window_no * 6 + 6)    AS mob_window,
+    h.at_risk,
+    h.defaults,
+    ROUND(100.0 * h.h, 3)                                AS marginal_pd_pct,
+    ROUND(100.0 * h.h / 0.5, 3)                          AS approx_annual_hazard_pct,
+    ROUND(100.0 * s.s, 2)                                AS survival_pct,
+    ROUND(100.0 * (1 - s.s), 2)                          AS cumulative_pd_pct
+FROM haz h
+JOIN surv s
+  ON s.term_months = h.term_months
+ AND s.window_no   = h.window_no
+WHERE h.window_no * 6 < h.term_months
+ORDER BY h.term_months, h.window_no;
+
+
+-- ============================================================
+-- QUERY 5: Did underwriting quality change across vintages?
+-- ============================================================
+-- Context: When a lender grows fast, it often lends to weaker
+-- borrowers. Comparing the borrower profile at origination with
+-- the 12-month default rate shows whether worse vintages were
+-- caused by a riskier book (lower FICO, higher DTI, more E-G
+-- grades, more 60-month loans) or by something else (the
+-- economy). 12 months is used so vintages up to 2017 can be
+-- included.
+
+SELECT
+    vintage,
+    COUNT(*)                                                AS loans,
+    ROUND(AVG(fico), 0)                                     AS avg_fico,
+    ROUND(AVG(dti), 1)                                      AS avg_dti,
+    ROUND(AVG(int_rate), 2)                                 AS avg_interest_rate,
+    ROUND(AVG(funded_amnt), 0)                              AS avg_loan_size,
+    ROUND(100.0 * AVG(grade IN ('E', 'F', 'G')), 1)         AS pct_grade_e_to_g,
+    ROUND(100.0 * AVG(term_months = 60), 1)                 AS pct_60_month,
+    ROUND(100.0 * SUM(CASE WHEN loan_age >= 12 AND is_default = 1 AND exit_mob <= 12 THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN loan_age >= 12 THEN 1 ELSE 0 END), 0), 2) AS cdr_12m
+FROM vintage_base
+GROUP BY vintage
+ORDER BY vintage;
+
+
+-- ============================================================
+-- QUERY 6: Mix-adjusted vintage performance
+-- ============================================================
+-- Context: A vintage can look bad simply because it contains more
+-- low-grade loans. To separate "what we lent to" from "how it
+-- performed":
+--   expected_cdr_12m = 12-month default we would expect from the
+--                      vintage's grade mix, using each grade's
+--                      average across all vintages
+--   excess_pp        = actual minus expected (percentage points)
+--   performance_index = actual / expected (1.00 = as expected)
+-- A positive excess means the vintage did worse than its grades
+-- predicted: a sign of macro stress, grade recalibration by the
+-- lender, or weaker underwriting inside each grade.
+
+WITH eligible AS (
+    SELECT
+        vintage,
+        grade,
+        CASE WHEN is_default = 1 AND exit_mob <= 12 THEN 1.0 ELSE 0.0 END AS bad_12m
+    FROM vintage_base
+    WHERE loan_age >= 12
+),
+grade_benchmark AS (
+    SELECT grade, AVG(bad_12m) AS pd_12m
+    FROM eligible
+    GROUP BY grade
+)
+SELECT
+    e.vintage,
+    COUNT(*)                                            AS loans,
+    ROUND(100.0 * AVG(e.bad_12m), 2)                    AS actual_cdr_12m,
+    ROUND(100.0 * AVG(g.pd_12m), 2)                     AS expected_cdr_12m,
+    ROUND(100.0 * (AVG(e.bad_12m) - AVG(g.pd_12m)), 2)  AS excess_pp,
+    ROUND(AVG(e.bad_12m) / NULLIF(AVG(g.pd_12m), 0), 2) AS performance_index
+FROM eligible e
+JOIN grade_benchmark g ON e.grade = g.grade
+GROUP BY e.vintage
+ORDER BY e.vintage;
+
+
+-- ============================================================
+-- QUERY 7: Loss severity by vintage - EAD, recovery and LGD
+-- ============================================================
+-- Context: Default frequency is only half of credit loss. Using
+-- Loss = Exposure x (1 - Recovery) for defaulted loans:
+--   EAD           = funded amount - principal already repaid
+--   recovery_rate = (recoveries - collection fees) / EAD
+--   LGD           = 1 - recovery_rate
+--   net_loss_rate = total net loss / total funded for the vintage
+-- Recoveries take years to collect, so recent vintages will show
+-- artificially high LGD. Treat vintages after ~2016 with caution.
+
+SELECT
+    vintage,
+    SUM(is_default)                                                         AS defaulted_loans,
+    ROUND(SUM(CASE WHEN is_default = 1 THEN funded_amnt - total_rec_prncp END)
+          / 1000000.0, 2)                                                   AS ead_millions,
+    ROUND(AVG(CASE WHEN is_default = 1
+                   THEN (funded_amnt - total_rec_prncp) / funded_amnt END) * 100, 1)
+                                                                            AS avg_ead_pct_of_loan,
+    ROUND(100.0 * SUM(CASE WHEN is_default = 1 THEN recoveries - recovery_fee END)
+          / NULLIF(SUM(CASE WHEN is_default = 1 THEN funded_amnt - total_rec_prncp END), 0), 1)
+                                                                            AS recovery_rate_pct,
+    ROUND(100.0 - 100.0 * SUM(CASE WHEN is_default = 1 THEN recoveries - recovery_fee END)
+          / NULLIF(SUM(CASE WHEN is_default = 1 THEN funded_amnt - total_rec_prncp END), 0), 1)
+                                                                            AS lgd_pct,
+    ROUND(100.0 * SUM(CASE WHEN is_default = 1
+                           THEN funded_amnt - total_rec_prncp - (recoveries - recovery_fee) ELSE 0 END)
+          / SUM(funded_amnt), 2)                                            AS net_loss_rate_pct
+FROM vintage_base
+GROUP BY vintage
+ORDER BY vintage;
+
+
+-- ============================================================
+-- QUERY 8: Was each vintage priced for the losses it produced?
+--          (Credit triangle check)
+-- ============================================================
+-- Context: The CQF credit triangle says a fair credit spread is
+-- roughly  spread ~ lambda x (1 - RR) = annual default x LGD.
+-- For FULLY MATURE 36-month vintages (every loan at least 36
+-- months old) we compare:
+--   avg_interest_rate        what borrowers paid
+--   break_even_spread_pct    annual default rate x LGD
+--                            (annual default ~ 36-month CDR / 3)
+--   margin_after_loss_pct    interest rate - break-even spread
+-- A thin or negative margin means the vintage did not earn
+-- enough to cover its credit losses, before funding and
+-- operating costs. Simplification: ignores amortisation (the
+-- balance falls over time) and discounting, so it is a sense
+-- check rather than a full pricing model.
+
+WITH mature AS (
+    SELECT *
+    FROM vintage_base
+    WHERE term_months = 36
+      AND loan_age >= 36
+),
+lgd AS (
+    SELECT
+        vintage,
+        1.0 - SUM(recoveries - recovery_fee)
+              / NULLIF(SUM(funded_amnt - total_rec_prncp), 0) AS lgd
+    FROM mature
+    WHERE is_default = 1
+    GROUP BY vintage
+)
+SELECT
+    m.vintage,
+    COUNT(*)                                                            AS loans,
+    ROUND(AVG(m.int_rate), 2)                                           AS avg_interest_rate,
+    ROUND(100.0 * AVG(CASE WHEN m.is_default = 1 AND m.exit_mob <= 36 THEN 1.0 ELSE 0.0 END), 2)
+                                                                        AS cdr_36m,
+    ROUND(100.0 * l.lgd, 1)                                             AS lgd_pct,
+    ROUND(100.0 * AVG(CASE WHEN m.is_default = 1 AND m.exit_mob <= 36 THEN 1.0 ELSE 0.0 END) / 3 * l.lgd, 2)
+                                                                        AS break_even_spread_pct,
+    ROUND(AVG(m.int_rate)
+          - 100.0 * AVG(CASE WHEN m.is_default = 1 AND m.exit_mob <= 36 THEN 1.0 ELSE 0.0 END) / 3 * l.lgd, 2)
+                                                                        AS margin_after_loss_pct
+FROM mature m
+JOIN lgd l ON m.vintage = l.vintage
+GROUP BY m.vintage, l.lgd
+HAVING COUNT(*) >= 1000
+ORDER BY m.vintage;
