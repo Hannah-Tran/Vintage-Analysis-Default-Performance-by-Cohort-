@@ -48,11 +48,11 @@ The data ends in late 2018. A loan issued in 2012 has completed its full life, w
 
 
 ## 💡Concepts Applied
-- **Survival probability and hazard rate:** `P(0,T) = exp(−∫λ dt)` and `λᵢ = −(1/τ)·ln(P(Tᵢ)/P(Tᵢ₋₁))` (CQF Lecture 5.7, Estimating Default Probability), estimated empirically from loan outcomes
+- **Survival probability and hazard rate:** `P(0,T) = exp(−∫λ dt)` and `λᵢ = −(1/τ)·ln(P(Tᵢ)/P(Tᵢ₋₁))` , estimated empirically from loan outcomes
 - **Lifetime PD:** cumulative default at contract maturity, as used in IFRS 9 Stage 2 provisioning
 - **Expected Loss (PD × LGD × EAD):** each component measured by vintage
-- **Credit triangle:** `spread ≈ λ × (1 - RR)` (CQF M5S8), used as a break-even pricing check
-- **ECL / CVA analogy:** lifetime ECL shares the CVA structure `(1 − R) × ∫ EE × DF × dPD` (CQF M5S5); marginal PDs from the life table supply the dPD term
+- **Credit triangle:** `spread ≈ λ × (1 - RR)`, used as a break-even pricing check
+- **ECL / CVA analogy:** lifetime ECL shares the CVA structure `(1 − R) × ∫ EE × DF × dPD`; marginal PDs from the life table supply the dPD term
 - **Credit cycle analysis:** separating underwriting quality from macroeconomic conditions
 
 ## ✅ How to Reproduce
